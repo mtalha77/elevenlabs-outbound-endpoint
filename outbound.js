@@ -6,7 +6,6 @@ import Twilio from "twilio";
 import WebSocket from "ws";
 import fastifyCors from "@fastify/cors";
 
-
 // Load environment variables from .env file
 dotenv.config();
 
@@ -38,7 +37,6 @@ await fastify.register(fastifyCors, {
   methods: ["GET", "POST", "OPTIONS"],
 });
 
-
 const PORT = process.env.PORT || 3000;
 
 fastify.get("/", async (_, reply) => {
@@ -46,6 +44,24 @@ fastify.get("/", async (_, reply) => {
 });
 
 const twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// Track active calls and clients
+const activeCalls = new Map();
+const wsClients = new Set();
+
+// Function to broadcast call status updates to all connected clients
+function broadcastCallUpdate(callData) {
+  const updateMessage = JSON.stringify({
+    type: 'call_status_update',
+    ...callData
+  });
+  
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(updateMessage);
+    }
+  }
+}
 
 async function getSignedUrl() {
   try {
@@ -71,6 +87,7 @@ async function getSignedUrl() {
   }
 }
 
+// Updated outbound-call endpoint to include status callbacks
 fastify.post("/outbound-call", async (request, reply) => {
   const { number, prompt, first_message } = request.body;
 
@@ -79,6 +96,7 @@ fastify.post("/outbound-call", async (request, reply) => {
   }
 
   try {
+    // Create call with status callbacks
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to: number,
@@ -87,6 +105,27 @@ fastify.post("/outbound-call", async (request, reply) => {
       }/outbound-call-twiml?prompt=${encodeURIComponent(
         prompt
       )}&first_message=${encodeURIComponent(first_message)}`,
+      // Add status callback
+      statusCallback: `https://${request.headers.host}/call-status-callback`,
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+      statusCallbackMethod: 'POST'
+    });
+
+    // Store call information
+    activeCalls.set(call.sid, {
+      callSid: call.sid,
+      number,
+      status: 'initiated',
+      startTime: new Date(),
+      prompt,
+      first_message
+    });
+
+    // Broadcast call initiation to all clients
+    broadcastCallUpdate({
+      callSid: call.sid,
+      number,
+      status: 'initiated'
     });
 
     reply.send({
@@ -101,6 +140,75 @@ fastify.post("/outbound-call", async (request, reply) => {
       error: "Failed to initiate call",
     });
   }
+});
+
+// New endpoint to check call status
+fastify.get("/call-status/:callSid", async (request, reply) => {
+  const { callSid } = request.params;
+  
+  try {
+    // First check our local cache
+    if (activeCalls.has(callSid)) {
+      reply.send({
+        success: true,
+        call: activeCalls.get(callSid)
+      });
+      return;
+    }
+    
+    // If not in cache, check with Twilio API
+    const call = await twilioClient.calls(callSid).fetch();
+    
+    reply.send({
+      success: true,
+      call: {
+        callSid: call.sid,
+        status: call.status,
+        duration: call.duration || 0,
+        startTime: call.dateCreated,
+        endTime: call.dateUpdated
+      }
+    });
+  } catch (error) {
+    console.error(`Error fetching call status for ${callSid}:`, error);
+    reply.code(500).send({
+      success: false,
+      error: "Failed to fetch call status"
+    });
+  }
+});
+
+// Add status callback endpoint
+fastify.post("/call-status-callback", async (request, reply) => {
+  const { CallSid, CallStatus, CallDuration } = request.body;
+  
+  console.log(`[Twilio] Call ${CallSid} status update: ${CallStatus}, duration: ${CallDuration}s`);
+  
+  // Update call status in our map
+  if (activeCalls.has(CallSid)) {
+    const callInfo = activeCalls.get(CallSid);
+    callInfo.status = CallStatus;
+    callInfo.duration = CallDuration || 0;
+    
+    // If call is complete, add end time
+    if (['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(CallStatus)) {
+      callInfo.endTime = new Date();
+      
+      // Remove call from active calls after some time
+      setTimeout(() => {
+        activeCalls.delete(CallSid);
+      }, 3600000); // Keep for 1 hour
+    }
+    
+    // Broadcast update to all clients
+    broadcastCallUpdate({
+      callSid: CallSid,
+      status: CallStatus,
+      duration: CallDuration || 0
+    });
+  }
+  
+  reply.send({ success: true });
 });
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
@@ -120,6 +228,7 @@ fastify.all("/outbound-call-twiml", async (request, reply) => {
   reply.type("text/xml").send(twimlResponse);
 });
 
+// ElevenLabs WebSocket handler
 fastify.register(async (fastifyInstance) => {
   fastifyInstance.get(
     "/outbound-media-stream",
@@ -131,6 +240,7 @@ fastify.register(async (fastifyInstance) => {
       let callSid = null;
       let elevenLabsWs = null;
       let customParameters = null;
+      let conversationEnded = false;
 
       ws.on("error", console.error);
 
@@ -240,6 +350,24 @@ fastify.register(async (fastifyInstance) => {
                     `[Twilio] User transcript: ${message.user_transcription_event?.user_transcript}`
                   );
                   break;
+                  
+                case "conversation_ended":
+                  console.log(`[ElevenLabs] Conversation ended`);
+                  conversationEnded = true;
+                  
+                  // Update call status if possible
+                  if (callSid && activeCalls.has(callSid)) {
+                    const callInfo = activeCalls.get(callSid);
+                    callInfo.conversationEnded = true;
+                    
+                    // Broadcast this information
+                    broadcastCallUpdate({
+                      callSid,
+                      status: 'conversation_ended',
+                      conversationEnded: true
+                    });
+                  }
+                  break;
 
                 default:
                   console.log(
@@ -257,6 +385,19 @@ fastify.register(async (fastifyInstance) => {
 
           elevenLabsWs.on("close", () => {
             console.log("[ElevenLabs] Disconnected");
+            
+            // Update call status if possible
+            if (callSid && activeCalls.has(callSid)) {
+              const callInfo = activeCalls.get(callSid);
+              callInfo.elevenLabsDisconnected = true;
+              
+              // Broadcast this information
+              broadcastCallUpdate({
+                callSid,
+                status: callInfo.status,
+                elevenLabsDisconnected: true
+              });
+            }
           });
         } catch (error) {
           console.error("[ElevenLabs] Setup error:", error);
@@ -281,6 +422,20 @@ fastify.register(async (fastifyInstance) => {
                 `[Twilio] Stream started - StreamSid: ${streamSid}, CallSid: ${callSid}`
               );
               console.log("[Twilio] Start parameters:", customParameters);
+              
+              // Update call status if we have it
+              if (activeCalls.has(callSid)) {
+                const callInfo = activeCalls.get(callSid);
+                callInfo.status = 'in-progress';
+                callInfo.streamSid = streamSid;
+                
+                // Broadcast update
+                broadcastCallUpdate({
+                  callSid,
+                  status: 'in-progress',
+                  streamSid
+                });
+              }
               break;
 
             case "media":
@@ -297,6 +452,20 @@ fastify.register(async (fastifyInstance) => {
 
             case "stop":
               console.log(`[Twilio] Stream ${streamSid} ended`);
+              
+              // Update call status if possible
+              if (callSid && activeCalls.has(callSid)) {
+                const callInfo = activeCalls.get(callSid);
+                callInfo.streamEnded = true;
+                
+                // Broadcast this information
+                broadcastCallUpdate({
+                  callSid,
+                  status: callInfo.status,
+                  streamEnded: true
+                });
+              }
+              
               if (elevenLabsWs?.readyState === WebSocket.OPEN) {
                 elevenLabsWs.close();
               }
@@ -312,9 +481,56 @@ fastify.register(async (fastifyInstance) => {
 
       ws.on("close", () => {
         console.log("[Twilio] Client disconnected from outbound media stream");
+        
+        // Update call status if possible
+        if (callSid && activeCalls.has(callSid)) {
+          const callInfo = activeCalls.get(callSid);
+          callInfo.twilioDisconnected = true;
+          
+          // Broadcast this information
+          broadcastCallUpdate({
+            callSid,
+            status: callInfo.status,
+            twilioDisconnected: true
+          });
+        }
+        
         if (elevenLabsWs?.readyState === WebSocket.OPEN) {
           elevenLabsWs.close();
         }
+      });
+    }
+  );
+});
+
+// Add WebSocket endpoint for call status updates
+fastify.register(async (fastifyInstance) => {
+  fastifyInstance.get(
+    "/call-status-ws",
+    { websocket: true },
+    (connection, req) => {
+      console.log("[Server] Client connected to call status WebSocket");
+      
+      // Add to clients list
+      wsClients.add(connection);
+      
+      // Send initial active calls data
+      if (activeCalls.size > 0) {
+        const activeCallsData = Array.from(activeCalls.values());
+        connection.send(JSON.stringify({
+          type: 'active_calls',
+          calls: activeCallsData
+        }));
+      }
+      
+      connection.on("message", (message) => {
+        // Handle any client messages if needed
+        console.log("[WebSocket] Received message from client:", message.toString());
+      });
+      
+      connection.on("close", () => {
+        console.log("[Server] Client disconnected from call status WebSocket");
+        wsClients.delete(connection);
       });
     }
   );
@@ -327,4 +543,3 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
   }
   console.log(`[Server] Listening on port ${PORT}`);
 });
-
