@@ -34,9 +34,112 @@ if (
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
+
+// UPDATED CORS CONFIGURATION - more comprehensive
 await fastify.register(fastifyCors, {
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
+  // Allow specific origins instead of wildcard "*"
+  origin: (origin, cb) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) {
+      return cb(null, true);
+    }
+    
+    // List of allowed origins
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'http://127.0.0.1:3000',
+      // Add your production domains here
+      'https://your-production-domain.com',
+      // During development you can allow all origins, but this is less secure
+      // Comment out in production
+      origin // This allows the requesting origin
+    ];
+    
+    // Check if origin is in allowedOrigins
+    if (allowedOrigins.includes(origin)) {
+      return cb(null, true);
+    }
+    
+    // Optional: For development, you can allow all origins
+    // return cb(null, true);
+    
+    return cb(null, true); // Currently allowing all origins for development
+  },
+  // Specify allowed methods
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  // Specify allowed headers
+  allowedHeaders: [
+    'Origin', 
+    'X-Requested-With', 
+    'Content-Type', 
+    'Accept', 
+    'Authorization'
+  ],
+  // Expose these headers to the browser
+  exposedHeaders: ['Content-Disposition'],
+  // Allow credentials (cookies, authorization headers)
+  credentials: true,
+  // Cache preflight requests for 1 hour (3600 seconds)
+  maxAge: 3600,
+  // Handle preflight success response
+  preflightContinue: false,
+  // Success status for preflight responses
+  optionsSuccessStatus: 204
+});
+
+// Add new proxy endpoint to handle CORS issues
+fastify.post("/proxy-outbound-call", async (request, reply) => {
+  const { number, prompt, first_message } = request.body;
+
+  if (!number) {
+    return reply.code(400).send({ error: "Phone number is required" });
+  }
+
+  try {
+    // Create call with status callbacks
+    const call = await twilioClient.calls.create({
+      from: TWILIO_PHONE_NUMBER,
+      to: number,
+      url: `https://${
+        request.headers.host
+      }/outbound-call-twiml?prompt=${encodeURIComponent(
+        prompt
+      )}&first_message=${encodeURIComponent(first_message)}`,
+      // Add status callback
+      statusCallback: `https://${request.headers.host}/call-status-callback`,
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+      statusCallbackMethod: 'POST'
+    });
+
+    // Store call information
+    activeCalls.set(call.sid, {
+      callSid: call.sid,
+      number,
+      status: 'initiated',
+      startTime: new Date(),
+      prompt,
+      first_message
+    });
+
+    // Broadcast call initiation to all clients
+    broadcastCallUpdate({
+      callSid: call.sid,
+      number,
+      status: 'initiated'
+    });
+
+    reply.send({
+      success: true,
+      message: "Call initiated",
+      callSid: call.sid,
+    });
+  } catch (error) {
+    console.error("Error initiating outbound call:", error);
+    reply.code(500).send({
+      success: false,
+      error: "Failed to initiate call",
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
@@ -309,6 +412,48 @@ fastify.post("/call-status-callback", async (request, reply) => {
   }
   
   reply.send({ success: true });
+});
+
+// Add endpoint to end a call
+fastify.post("/end-call/:callSid", async (request, reply) => {
+  const { callSid } = request.params;
+  
+  if (!callSid) {
+    return reply.code(400).send({ error: "Call SID is required" });
+  }
+  
+  try {
+    // Try to end the call via Twilio API
+    await twilioClient.calls(callSid).update({
+      status: 'completed'
+    });
+    
+    // Update our local tracking
+    if (activeCalls.has(callSid)) {
+      const callInfo = activeCalls.get(callSid);
+      callInfo.status = 'completed';
+      callInfo.endTime = new Date();
+      callInfo.manuallyEnded = true;
+      
+      // Broadcast the update
+      broadcastCallUpdate({
+        callSid,
+        status: 'completed',
+        manuallyEnded: true
+      });
+    }
+    
+    reply.send({
+      success: true,
+      message: "Call ended successfully"
+    });
+  } catch (error) {
+    console.error(`Error ending call ${callSid}:`, error);
+    reply.code(500).send({
+      success: false,
+      error: "Failed to end call"
+    });
+  }
 });
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
@@ -670,6 +815,12 @@ fastify.register(async (fastifyInstance) => {
   );
 });
 
+// Add health check endpoint
+fastify.get("/health", async (_, reply) => {
+  reply.send({ status: "ok", time: new Date().toISOString() });
+});
+
+// Start the server
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
   if (err) {
     console.error("Error starting server:", err);
