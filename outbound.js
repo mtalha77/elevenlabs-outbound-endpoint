@@ -16,6 +16,7 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
+  FORWARDING_PHONE_NUMBER, // New environment variable for forwarding
 } = process.env;
 
 if (
@@ -23,7 +24,8 @@ if (
   !ELEVENLABS_AGENT_ID ||
   !TWILIO_ACCOUNT_SID ||
   !TWILIO_AUTH_TOKEN ||
-  !TWILIO_PHONE_NUMBER
+  !TWILIO_PHONE_NUMBER ||
+  !FORWARDING_PHONE_NUMBER
 ) {
   console.error("Missing required environment variables");
   throw new Error("Missing required environment variables");
@@ -49,12 +51,85 @@ const twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const activeCalls = new Map();
 const wsClients = new Set();
 
+// Function to detect if the user wants to speak to a human
+function shouldTransferToHuman(transcript) {
+  const transferPhrases = [
+    "human",
+    "representative",
+    "agent",
+    "person", 
+    "speak to someone",
+    "talk to someone",
+    "real person",
+    "transfer",
+    "speak with a human",
+    "talk with a human"
+  ];
+  
+  const lowerTranscript = transcript.toLowerCase();
+  
+  // Look for patterns that indicate user wants to speak to a human
+  for (const phrase of transferPhrases) {
+    if (
+      lowerTranscript.includes(`speak to a ${phrase}`) ||
+      lowerTranscript.includes(`talk to a ${phrase}`) ||
+      lowerTranscript.includes(`transfer to a ${phrase}`) ||
+      lowerTranscript.includes(`connect me to a ${phrase}`) ||
+      lowerTranscript.includes(`get me a ${phrase}`) ||
+      lowerTranscript.includes(`i want a ${phrase}`)
+    ) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// Function to forward a call to a human representative
+async function forwardCallToHuman(callSid) {
+  try {
+    console.log(`[Twilio] Forwarding call ${callSid} to human at ${FORWARDING_PHONE_NUMBER}`);
+    
+    // Update the call status
+    if (activeCalls.has(callSid)) {
+      const callInfo = activeCalls.get(callSid);
+      callInfo.status = 'forwarding';
+      callInfo.forwardingTime = new Date();
+      
+      // Broadcast update to all clients
+      broadcastCallUpdate({
+        callSid,
+        status: 'forwarding',
+        forwardingTo: FORWARDING_PHONE_NUMBER.replace(/\d(?=\d{4})/g, "*") // Mask most digits
+      });
+    }
+    
+    // Use Twilio's API to update the call with new TwiML
+    const call = await twilioClient.calls(callSid).update({
+      twiml: `<?xml version="1.0" encoding="UTF-8"?>
+        <Response>
+          <Say>Please wait while we transfer you to a human representative.</Say>
+          <Dial callerId="${TWILIO_PHONE_NUMBER}">${FORWARDING_PHONE_NUMBER}</Dial>
+          <Say>The call has ended. Thank you for your time.</Say>
+          <Hangup/>
+        </Response>`
+    });
+    
+    return call;
+  } catch (error) {
+    console.error(`[Twilio] Error forwarding call ${callSid}:`, error);
+    throw error;
+  }
+}
+
 // Function to broadcast call status updates to all connected clients
 function broadcastCallUpdate(callData) {
   const updateMessage = JSON.stringify({
     type: 'call_status_update',
     ...callData
   });
+  
+  console.log(`[Server] Broadcasting call update: ${callData.status} for ${callData.callSid}`);
   
   for (const client of wsClients) {
     if (client.readyState === WebSocket.OPEN) {
@@ -138,6 +213,31 @@ fastify.post("/outbound-call", async (request, reply) => {
     reply.code(500).send({
       success: false,
       error: "Failed to initiate call",
+    });
+  }
+});
+
+// Manual forwarding endpoint
+fastify.post("/forward-call/:callSid", async (request, reply) => {
+  const { callSid } = request.params;
+  
+  if (!callSid) {
+    return reply.code(400).send({ error: "Call SID is required" });
+  }
+  
+  try {
+    await forwardCallToHuman(callSid);
+    
+    reply.send({
+      success: true,
+      message: "Call forwarded successfully",
+      callSid
+    });
+  } catch (error) {
+    console.error(`Error forwarding call ${callSid}:`, error);
+    reply.code(500).send({
+      success: false,
+      error: "Failed to forward call"
     });
   }
 });
@@ -346,9 +446,43 @@ fastify.register(async (fastifyInstance) => {
                   break;
 
                 case "user_transcript":
-                  console.log(
-                    `[Twilio] User transcript: ${message.user_transcription_event?.user_transcript}`
-                  );
+                  const userTranscript = message.user_transcription_event?.user_transcript || "";
+                  console.log(`[Twilio] User transcript: ${userTranscript}`);
+                  
+                  // Check if user wants to talk to a human
+                  if (shouldTransferToHuman(userTranscript)) {
+                    console.log(`[Twilio] User requested to speak with a human: "${userTranscript}"`);
+                    
+                    // Let the AI say goodbye
+                    if (elevenLabsWs?.readyState === WebSocket.OPEN) {
+                      elevenLabsWs.send(JSON.stringify({
+                        type: "interrupt"
+                      }));
+                      
+                      // Wait a short time for any current audio to finish
+                      setTimeout(() => {
+                        // Send a message to ElevenLabs to say goodbye
+                        elevenLabsWs.send(JSON.stringify({
+                          type: "user_message",
+                          user_message_event: {
+                            user_message: "[SYSTEM: User requested transfer to human. Please acknowledge and say goodbye.]"
+                          }
+                        }));
+                        
+                        // After the AI has had a chance to respond, forward the call
+                        setTimeout(async () => {
+                          try {
+                            await forwardCallToHuman(callSid);
+                          } catch (error) {
+                            console.error(`[Twilio] Error forwarding call:`, error);
+                          }
+                        }, 5000); // Wait 5 seconds for AI goodbye
+                      }, 500);
+                    } else {
+                      // If ElevenLabs connection isn't open, forward immediately
+                      forwardCallToHuman(callSid).catch(console.error);
+                    }
+                  }
                   break;
                   
                 case "conversation_ended":
