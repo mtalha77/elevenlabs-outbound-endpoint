@@ -142,7 +142,7 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 fastify.get("/", async (_, reply) => {
   reply.send({ message: "Server is running" });
@@ -156,6 +156,9 @@ const wsClients = new Set();
 
 // Function to detect if the user wants to speak to a human
 function shouldTransferToHuman(transcript) {
+  // Strip punctuation and convert to lowercase for more reliable matching
+  const cleanTranscript = transcript.toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "");
+  
   const transferPhrases = [
     "human",
     "representative",
@@ -169,20 +172,25 @@ function shouldTransferToHuman(transcript) {
     "talk with a human"
   ];
   
-  const lowerTranscript = transcript.toLowerCase();
-  
-  // Look for patterns that indicate user wants to speak to a human
+  // More aggressive matching - check if ANY of these phrases appear ANYWHERE in the transcript
   for (const phrase of transferPhrases) {
-    if (
-      lowerTranscript.includes(`speak to a ${phrase}`) ||
-      lowerTranscript.includes(`talk to a ${phrase}`) ||
-      lowerTranscript.includes(`transfer to a ${phrase}`) ||
-      lowerTranscript.includes(`connect me to a ${phrase}`) ||
-      lowerTranscript.includes(`get me a ${phrase}`) ||
-      lowerTranscript.includes(`i want a ${phrase}`)
-    ) {
+    if (cleanTranscript.includes(phrase)) {
+      console.log(`[Twilio] Transfer phrase detected: "${phrase}" in "${cleanTranscript}"`);
       return true;
     }
+  }
+  
+  // Also detect "speak with" or "talk with" or "talk to" or "speak to" patterns
+  if (
+    cleanTranscript.includes("speak with") || 
+    cleanTranscript.includes("talk with") ||
+    cleanTranscript.includes("speak to") ||
+    cleanTranscript.includes("talk to") ||
+    cleanTranscript.includes("transfer me") ||
+    cleanTranscript.includes("connect me")
+  ) {
+    console.log(`[Twilio] Transfer phrase detected in pattern: "${cleanTranscript}"`);
+    return true;
   }
   
   return false;
@@ -191,36 +199,59 @@ function shouldTransferToHuman(transcript) {
 // Function to forward a call to a human representative
 async function forwardCallToHuman(callSid) {
   try {
-    console.log(`[Twilio] Forwarding call ${callSid} to human at ${FORWARDING_PHONE_NUMBER}`);
+    console.log(`[Twilio] ⚠️ FORWARDING CALL ${callSid} to human at ${FORWARDING_PHONE_NUMBER}`);
     
     // Update the call status
     if (activeCalls.has(callSid)) {
       const callInfo = activeCalls.get(callSid);
       callInfo.status = 'forwarding';
       callInfo.forwardingTime = new Date();
+      callInfo.forwardingInProgress = true;
       
       // Broadcast update to all clients
       broadcastCallUpdate({
         callSid,
         status: 'forwarding',
-        forwardingTo: FORWARDING_PHONE_NUMBER.replace(/\d(?=\d{4})/g, "*") // Mask most digits
+        forwardingTo: FORWARDING_PHONE_NUMBER.replace(/\d(?=\d{4})/g, "*"), // Mask most digits
+        forwardingInProgress: true
       });
     }
     
     // Use Twilio's API to update the call with new TwiML
+    // We're using a more direct TwiML that immediately dials without extra conversation
     const call = await twilioClient.calls(callSid).update({
       twiml: `<?xml version="1.0" encoding="UTF-8"?>
         <Response>
-          <Say>Please wait while we transfer you to a human representative.</Say>
-          <Dial callerId="${TWILIO_PHONE_NUMBER}">${FORWARDING_PHONE_NUMBER}</Dial>
+          <Say>Transferring you to a human representative now. Please hold.</Say>
+          <Dial callerId="${TWILIO_PHONE_NUMBER}" timeout="30" record="record-from-answer">
+            ${FORWARDING_PHONE_NUMBER}
+          </Dial>
           <Say>The call has ended. Thank you for your time.</Say>
           <Hangup/>
         </Response>`
     });
     
+    console.log(`[Twilio] ✓ Forward request sent successfully to Twilio API for call ${callSid}`);
+    
     return call;
   } catch (error) {
-    console.error(`[Twilio] Error forwarding call ${callSid}:`, error);
+    console.error(`[Twilio] ❌ Error forwarding call ${callSid}:`, error);
+    
+    // Update the call status to indicate forwarding failed
+    if (activeCalls.has(callSid)) {
+      const callInfo = activeCalls.get(callSid);
+      callInfo.status = 'completed'; // Mark as completed even if forwarding failed
+      callInfo.completionReason = 'forwarding_failed';
+      callInfo.endTime = new Date();
+      
+      // Broadcast the failure
+      broadcastCallUpdate({
+        callSid,
+        status: 'completed',
+        completionReason: 'forwarding_failed'
+      });
+    }
+    
     throw error;
   }
 }
@@ -266,12 +297,38 @@ async function getSignedUrl() {
 }
 
 // Updated outbound-call endpoint to include status callbacks
+
+const recentCallAttempts = new Map();
+const CALL_COOLDOWN = 60000; // 1 minute cooldown between calls to the same number
+
+
 fastify.post("/outbound-call", async (request, reply) => {
   const { number, prompt, first_message } = request.body;
 
   if (!number) {
     return reply.code(400).send({ error: "Phone number is required" });
   }
+
+  // Check if we've recently attempted to call this number
+  const now = Date.now();
+  const lastAttempt = recentCallAttempts.get(number);
+  
+  if (lastAttempt && (now - lastAttempt) < CALL_COOLDOWN) {
+    console.log(`[Server] Prevented duplicate call to ${number}, last attempt was ${(now - lastAttempt)/1000}s ago`);
+    return reply.code(429).send({
+      success: false,
+      error: "Rate limited. Please wait before trying to call this number again.",
+      cooldownRemaining: Math.ceil((CALL_COOLDOWN - (now - lastAttempt))/1000)
+    });
+  }
+  
+  // Record this attempt
+  recentCallAttempts.set(number, now);
+  
+  // Clean up old entries every hour
+  setTimeout(() => {
+    recentCallAttempts.delete(number);
+  }, 3600000); // 1 hour
 
   try {
     // Create call with status callbacks
@@ -283,6 +340,10 @@ fastify.post("/outbound-call", async (request, reply) => {
       }/outbound-call-twiml?prompt=${encodeURIComponent(
         prompt
       )}&first_message=${encodeURIComponent(first_message)}`,
+      // Set these parameters to reduce voicemail chances
+      timeout: 15,                        // Hang up if no answer after 15 seconds
+      machineDetection: 'DetectMessageEnd',  // Detect answering machines
+      machineDetectionTimeout: 10,       // Wait up to 10 seconds for machine detection
       // Add status callback
       statusCallback: `https://${request.headers.host}/call-status-callback`,
       statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
@@ -315,11 +376,10 @@ fastify.post("/outbound-call", async (request, reply) => {
     console.error("Error initiating outbound call:", error);
     reply.code(500).send({
       success: false,
-      error: "Failed to initiate call",
+      error: "Failed to initiate call: " + error.message,
     });
   }
 });
-
 // Manual forwarding endpoint
 fastify.post("/forward-call/:callSid", async (request, reply) => {
   const { callSid } = request.params;
@@ -381,33 +441,49 @@ fastify.get("/call-status/:callSid", async (request, reply) => {
   }
 });
 
-// Add status callback endpoint
 fastify.post("/call-status-callback", async (request, reply) => {
-  const { CallSid, CallStatus, CallDuration } = request.body;
+  const { CallSid, CallStatus, CallDuration, AnsweredBy } = request.body;
   
-  console.log(`[Twilio] Call ${CallSid} status update: ${CallStatus}, duration: ${CallDuration}s`);
+  console.log(`[Twilio] Call ${CallSid} status update: ${CallStatus}, duration: ${CallDuration}s, answered by: ${AnsweredBy || 'unknown'}`);
+  console.log(`[Twilio] Full callback data:`, request.body);
   
   // Update call status in our map
   if (activeCalls.has(CallSid)) {
     const callInfo = activeCalls.get(CallSid);
-    callInfo.status = CallStatus;
+    
+    // Always update duration
     callInfo.duration = CallDuration || 0;
     
-    // If call is complete, add end time
-    if (['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(CallStatus)) {
+    // Handle status update based on current state
+    if (callInfo.status === 'forwarding' && CallStatus === 'completed') {
+      // Call was forwarded and now completed
+      callInfo.status = 'completed';
+      callInfo.completionReason = callInfo.completionReason || 'forwarded_call_ended';
+      console.log(`[Twilio] Call ${CallSid} was forwarded and is now complete`);
+    } else if (['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(CallStatus)) {
+      // Normal call completion states
+      callInfo.status = CallStatus;
       callInfo.endTime = new Date();
+      
+      console.log(`[Twilio] Call ${CallSid} reached terminal state: ${CallStatus}`);
       
       // Remove call from active calls after some time
       setTimeout(() => {
+        console.log(`[Twilio] Removing call ${CallSid} from active calls map`);
         activeCalls.delete(CallSid);
       }, 3600000); // Keep for 1 hour
+    } else {
+      // Other status updates
+      callInfo.status = CallStatus;
     }
     
     // Broadcast update to all clients
     broadcastCallUpdate({
       callSid: CallSid,
-      status: CallStatus,
-      duration: CallDuration || 0
+      status: callInfo.status,
+      duration: CallDuration || 0,
+      completionReason: callInfo.completionReason,
+      answeredBy: AnsweredBy
     });
   }
   
@@ -460,18 +536,20 @@ fastify.all("/outbound-call-twiml", async (request, reply) => {
   const prompt = request.query.prompt || "";
   const first_message = request.query.first_message || "";
 
+  // Simplified TwiML - direct connection to the media stream without Gather blocks
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Connect>
-        <Stream url="wss://${request.headers.host}/outbound-media-stream">
-            <Parameter name="prompt" value="${prompt}" />
-            <Parameter name="first_message" value="${first_message}" />
-        </Stream>
+            <Stream url="wss://${request.headers.host}/outbound-media-stream">
+                <Parameter name="prompt" value="${prompt}" />
+                <Parameter name="first_message" value="${first_message}" />
+            </Stream>
         </Connect>
     </Response>`;
 
   reply.type("text/xml").send(twimlResponse);
 });
+
 
 // ElevenLabs WebSocket handler
 fastify.register(async (fastifyInstance) => {
@@ -500,8 +578,8 @@ fastify.register(async (fastifyInstance) => {
             const initialConfig = {
               type: "conversation_initiation_client_data",
               dynamic_variables: {
-                user_name: "Angelo",
-                user_id: 1234,
+                user_name: "User",  // More generic name
+                user_id: Math.floor(Math.random() * 10000), // Random ID to avoid conflicts
               },
               conversation_config_override: {
                 agent: {
@@ -590,45 +668,52 @@ fastify.register(async (fastifyInstance) => {
                   );
                   break;
 
-                case "user_transcript":
-                  const userTranscript = message.user_transcription_event?.user_transcript || "";
-                  console.log(`[Twilio] User transcript: ${userTranscript}`);
-                  
-                  // Check if user wants to talk to a human
-                  if (shouldTransferToHuman(userTranscript)) {
-                    console.log(`[Twilio] User requested to speak with a human: "${userTranscript}"`);
+                  case "user_transcript":
+                    const userTranscript = message.user_transcription_event?.user_transcript || "";
+                    console.log(`[Twilio] User transcript: "${userTranscript}"`);
                     
-                    // Let the AI say goodbye
-                    if (elevenLabsWs?.readyState === WebSocket.OPEN) {
-                      elevenLabsWs.send(JSON.stringify({
-                        type: "interrupt"
-                      }));
+                    // Check if user wants to talk to a human - with enhanced logging
+                    if (shouldTransferToHuman(userTranscript)) {
+                      console.log(`[Twilio] ✓ TRANSFER REQUESTED: "${userTranscript}"`);
                       
-                      // Wait a short time for any current audio to finish
-                      setTimeout(() => {
-                        // Send a message to ElevenLabs to say goodbye
+                      // Let the AI say goodbye
+                      if (elevenLabsWs?.readyState === WebSocket.OPEN) {
+                        console.log(`[Twilio] Sending interrupt to ElevenLabs`);
+                        
                         elevenLabsWs.send(JSON.stringify({
-                          type: "user_message",
-                          user_message_event: {
-                            user_message: "[SYSTEM: User requested transfer to human. Please acknowledge and say goodbye.]"
-                          }
+                          type: "interrupt"
                         }));
                         
-                        // After the AI has had a chance to respond, forward the call
-                        setTimeout(async () => {
-                          try {
-                            await forwardCallToHuman(callSid);
-                          } catch (error) {
-                            console.error(`[Twilio] Error forwarding call:`, error);
-                          }
-                        }, 5000); // Wait 5 seconds for AI goodbye
-                      }, 500);
-                    } else {
-                      // If ElevenLabs connection isn't open, forward immediately
-                      forwardCallToHuman(callSid).catch(console.error);
+                        // Wait a short time for any current audio to finish
+                        setTimeout(() => {
+                          // Send a message to ElevenLabs to say goodbye
+                          console.log(`[Twilio] Sending transfer message to ElevenLabs`);
+                          
+                          elevenLabsWs.send(JSON.stringify({
+                            type: "user_message",
+                            user_message_event: {
+                              user_message: "[SYSTEM_INSTRUCTION: User requested transfer to human. Say 'I'll transfer you to a human representative now. Please hold.' and then end the conversation.]"
+                            }
+                          }));
+                          
+                          // Immediately initiate the forwarding process with a shorter delay
+                          // Don't wait for AI to respond, as it may not
+                          setTimeout(async () => {
+                            try {
+                              console.log(`[Twilio] Initiating transfer to human for call ${callSid}`);
+                              await forwardCallToHuman(callSid);
+                            } catch (error) {
+                              console.error(`[Twilio] Error forwarding call:`, error);
+                            }
+                          }, 2000); // Reduced from 5000 to 2000
+                        }, 300);
+                      } else {
+                        // If ElevenLabs connection isn't open, forward immediately
+                        console.log(`[Twilio] ElevenLabs not connected, forwarding immediately`);
+                        forwardCallToHuman(callSid).catch(console.error);
+                      }
                     }
-                  }
-                  break;
+                    break;
                   
                 case "conversation_ended":
                   console.log(`[ElevenLabs] Conversation ended`);
@@ -670,11 +755,19 @@ fastify.register(async (fastifyInstance) => {
               const callInfo = activeCalls.get(callSid);
               callInfo.elevenLabsDisconnected = true;
               
-              // Broadcast this information
+              // If the call is in forwarding state, mark it as completed when ElevenLabs disconnects
+              if (callInfo.status === 'forwarding') {
+                callInfo.status = 'completed';
+                callInfo.completionReason = 'forwarded_to_human';
+                callInfo.endTime = new Date();
+              }
+              
+              // Broadcast this information with the updated status
               broadcastCallUpdate({
                 callSid,
                 status: callInfo.status,
-                elevenLabsDisconnected: true
+                elevenLabsDisconnected: true,
+                completionReason: callInfo.completionReason
               });
             }
           });
@@ -778,7 +871,7 @@ fastify.register(async (fastifyInstance) => {
           elevenLabsWs.close();
         }
       });
-    }
+    } 
   );
 });
 
@@ -814,6 +907,49 @@ fastify.register(async (fastifyInstance) => {
     }
   );
 });
+
+
+function cleanupStalledCalls() {
+  const now = new Date();
+  const MAX_CALL_DURATION = 15 * 60 * 1000; // 15 minutes in milliseconds
+  
+  for (const [callSid, callInfo] of activeCalls.entries()) {
+    // Skip calls that are already completed
+    if (['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(callInfo.status)) {
+      continue;
+    }
+    
+    const startTime = new Date(callInfo.startTime);
+    const callDuration = now - startTime;
+    
+    // If call has been going for more than MAX_CALL_DURATION, mark it as completed
+    if (callDuration > MAX_CALL_DURATION) {
+      console.log(`[Server] Auto-completing stalled call ${callSid} after ${callDuration/1000}s`);
+      
+      callInfo.status = 'completed';
+      callInfo.completionReason = 'timed_out';
+      callInfo.endTime = now;
+      
+      // Broadcast update
+      broadcastCallUpdate({
+        callSid,
+        status: 'completed',
+        completionReason: 'timed_out'
+      });
+      
+      // Try to end the call via Twilio
+      twilioClient.calls(callSid).update({
+        status: 'completed'
+      }).catch(error => {
+        console.error(`[Twilio] Error ending stalled call ${callSid}:`, error);
+      });
+    }
+  }
+}
+
+
+setInterval(cleanupStalledCalls, 60000);
+
 
 // Add health check endpoint
 fastify.get("/health", async (_, reply) => {
