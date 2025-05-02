@@ -6,15 +6,17 @@ import Twilio from "twilio";
 import WebSocket from "ws";
 import fastifyCors from "@fastify/cors";
 
+// Load environment variables from .env file
 dotenv.config();
 
+// Check for required environment variables
 const {
   ELEVENLABS_API_KEY,
   ELEVENLABS_AGENT_ID,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
-  FORWARDING_PHONE_NUMBER, 
+  FORWARDING_PHONE_NUMBER, // New environment variable for forwarding
 } = process.env;
 
 if (
