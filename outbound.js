@@ -42,14 +42,12 @@ await fastify.register(fastifyCors, {
       return cb(null, true);
     }
     
-    // List of allowed origins
     const allowedOrigins = [
       'http://localhost:3000',
       'http://127.0.0.1:3000',
       // Add your production domains here
-      'https://your-production-domain.com',
-      // During development you can allow all origins, but this is less secure
-      // Comment out in production
+      'https://www.rankorbit.ai',
+
       origin 
     ];
     
