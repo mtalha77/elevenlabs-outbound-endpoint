@@ -33,7 +33,7 @@ Here’s a professional `README.md` for your **Rank Orbit AI Auto Dialer** proje
 1. **Clone the repo:**
 
    ```bash
-   git clone https://github.com/your-username/rank-orbit-ai-auto-dialer.git
+   git clone https://github.com/mtalha77/elevenlabs-outbound-endpoint.git
    cd rank-orbit-ai-auto-dialer
 ````
 

@@ -5,6 +5,11 @@ import Fastify from "fastify";
 import Twilio from "twilio";
 import WebSocket from "ws";
 import fastifyCors from "@fastify/cors";
+import AWS from 'aws-sdk';
+
+
+AWS.config.update({ region: 'your-region' });
+const dynamoDB = new AWS.DynamoDB.DocumentClient();
 
 dotenv.config();
 
@@ -33,11 +38,8 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// UPDATED CORS CONFIGURATION - more comprehensive
 await fastify.register(fastifyCors, {
-  // Allow specific origins instead of wildcard "*"
   origin: (origin, cb) => {
-    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) {
       return cb(null, true);
     }
@@ -81,7 +83,7 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
   }
 
   try {
-    const call = await twilioClient.calls.create({
+    const call = await getTwilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to: number,
       url: `https://${
@@ -130,6 +132,16 @@ fastify.get("/", async (_, reply) => {
 });
 
 const twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// Cache it in a variable for reuse
+let cachedTwilioClient = null;
+
+function getTwilioClient() {
+  if (!cachedTwilioClient) {
+    cachedTwilioClient = twilioClient;
+  }
+  return cachedTwilioClient;
+}
 
 const activeCalls = new Map();
 const wsClients = new Set();
@@ -190,7 +202,7 @@ async function forwardCallToHuman(callSid) {
       });
     }
     
-    const call = await twilioClient.calls(callSid).update({
+    const call = await getTwilioClient.calls(callSid).update({
       twiml: `<?xml version="1.0" encoding="UTF-8"?>
         <Response>
           <Say>Transferring you to a human representative now. Please hold.</Say>
@@ -295,7 +307,7 @@ fastify.post("/outbound-call", async (request, reply) => {
   }, 3600000); 
 
   try {
-    const call = await twilioClient.calls.create({
+    const call = await getTwilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to: number,
       url: `https://${
@@ -381,7 +393,7 @@ fastify.get("/call-status/:callSid", async (request, reply) => {
     }
     
 
-    const call = await twilioClient.calls(callSid).fetch();
+    const call = await getTwilioClient.calls(callSid).fetch();
     
     reply.send({
       success: true,
@@ -460,7 +472,7 @@ fastify.post("/end-call/:callSid", async (request, reply) => {
   
   try {
 
-    await twilioClient.calls(callSid).update({
+    await getTwilioClient.calls(callSid).update({
       status: 'completed'
     });
     
@@ -903,7 +915,7 @@ function cleanupStalledCalls() {
       });
       
 
-      twilioClient.calls(callSid).update({
+      getTwilioClient.calls(callSid).update({
         status: 'completed'
       }).catch(error => {
         console.error(`[Twilio] Error ending stalled call ${callSid}:`, error);
