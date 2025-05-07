@@ -1,5 +1,11 @@
-node_modules
+env/
+node_modules/
 .git
 .env
-.env
 .gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
