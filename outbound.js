@@ -560,42 +560,34 @@ fastify.post("/end-call/:callSid", async (request, reply) => {
 
 // Helper function to get the appropriate base URL based on environment
 function getPublicBaseUrl(request) {
-  if (IS_AWS_ENV && process.env.PUBLIC_HOST_URL) {
-    return process.env.PUBLIC_HOST_URL;
-  }
-  return request.headers.host;
+  // fall back to headers if PUBLIC_HOST_URL isn’t set
+  return process.env.PUBLIC_HOST_URL
+    ? process.env.PUBLIC_HOST_URL
+    : `https://${request.headers.host}`
 }
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
-  const prompt = request.query.prompt || "";
-  const first_message = request.query.first_message || "";
+  const prompt = request.query.prompt || ""
+  const first_message = request.query.first_message || ""
 
-  // Get the appropriate hostname for this environment
-  const hostname = getPublicBaseUrl(request);
+  // build ws URL from your HTTP/HTTPS base
+  const raw = getPublicBaseUrl(request)
+  const streamUrl = raw.replace(/^http/, "ws") + "/outbound-media-stream"
 
-  // Log the URL being generated
-  console.log(
-    `[Twilio] Generating TwiML with stream URL: wss://${hostname}/outbound-media-stream`
-  );
-
-  // Use a simple approach - always use the hostname determined above
-  const streamUrl = `wss://${hostname}/outbound-media-stream`;
+  console.log(`[Twilio] Stream URL → ${streamUrl}`)
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-        <Connect>
-            <Stream url="${streamUrl}">
-                <Parameter name="prompt" value="${prompt}" />
-                <Parameter name="first_message" value="${first_message}" />
-            </Stream>
-        </Connect>
-    </Response>`;
+      <Connect>
+        <Stream url="${streamUrl}">
+          <Parameter name="prompt" value="${prompt}" />
+          <Parameter name="first_message" value="${first_message}" />
+        </Stream>
+      </Connect>
+    </Response>`
 
-  reply.type("text/xml").send(twimlResponse);
-
-  // Debug log the complete TwiML response
-  console.log(`[Twilio] TwiML Response: ${twimlResponse}`);
-});
+  reply.type("text/xml").send(twimlResponse)
+})
 
 // Create a diagnostic endpoint to verify WebSocket functionality
 fastify.get("/diagnostics", async (request, reply) => {
