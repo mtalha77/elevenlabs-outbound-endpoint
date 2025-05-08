@@ -560,11 +560,10 @@ fastify.post("/end-call/:callSid", async (request, reply) => {
 
 // Helper function to get the appropriate base URL based on environment
 function getPublicBaseUrl(request) {
-  // fall back to headers if PUBLIC_HOST_URL isn’t set
-  return process.env.PUBLIC_HOST_URL
-    ? process.env.PUBLIC_HOST_URL
-    : `https://${request.headers.host}`
+  const raw = process.env.PUBLIC_HOST_URL || request.headers.host;
+  return raw.replace(/^https?:\/\//, "");
 }
+
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
   const prompt = request.query.prompt || ""
