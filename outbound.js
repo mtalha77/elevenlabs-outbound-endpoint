@@ -564,6 +564,7 @@ function getPublicBaseUrl(request) {
   return raw.replace(/^https?:\/\//, "");
 }
 
+const STREAM_URL = process.env.STREAM_URL;
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
   console.log(`[TwiML] request for stream TwiML from ${request.ip}`);
@@ -577,10 +578,10 @@ fastify.all("/outbound-call-twiml", async (request, reply) => {
 
 
   // build ws URL from your HTTP/HTTPS base
-  const raw = getPublicBaseUrl(request)
+  // const raw = getPublicBaseUrl(request)
 
   console.log(`[Twilio] Raw URL: ${raw}`)
-  const streamUrl = raw.replace(/^http/, "ws") + "/outbound-media-stream"
+  // const streamUrl = origin.replace(/^http/, "ws") + "/outbound-media-stream";
 
 
   console.log(`[Twilio] Stream URL → ${streamUrl}`)
@@ -588,7 +589,7 @@ fastify.all("/outbound-call-twiml", async (request, reply) => {
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
       <Connect>
-        <Stream url="${streamUrl}">
+        <Stream url="${STREAM_URL}">
           <Parameter name="prompt" value="${prompt}" />
           <Parameter name="first_message" value="${first_message}" />
         </Stream>
