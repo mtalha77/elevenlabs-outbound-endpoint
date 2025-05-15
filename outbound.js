@@ -31,6 +31,7 @@ if (
 
 const fastify = Fastify({
   trustProxy: true, // Add this line
+    logger: true, // Enable logging for debugging
 });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
@@ -42,8 +43,8 @@ const elevenLabsUrlCache = new Map();
 const IS_AWS_ENV =
   process.env.NODE_ENV === "production" || process.env.IS_AWS === "true";
 
-const PUBLIC_HOST_URL_ = "https://auto-dialer-production-env.eba-bcakpgwm.us-west-2.elasticbeanstalk.com"
-// const PUBLIC_HOST_URL_ = new URL(PUBLIC_URL).host; 
+const PUBLIC_HOST_URL_ = new URL(process.env.PUBLIC_HOST_URL).host;
+
 
 // Pre-fetch ElevenLabs signed URL for faster connection when call is answered
 async function prefetchSignedUrl() {
