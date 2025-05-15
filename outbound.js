@@ -42,7 +42,7 @@ const elevenLabsUrlCache = new Map();
 const IS_AWS_ENV =
   process.env.NODE_ENV === "production" || process.env.IS_AWS === "true";
 
-PUBLIC_URL = "https://auto-dialer-production-env.eba-bcakpgwm.us-west-2.elasticbeanstalk.com"
+const PUBLIC_URL = "https://auto-dialer-production-env.eba-bcakpgwm.us-west-2.elasticbeanstalk.com"
 const PUBLIC_HOST_URL_ = new URL(PUBLIC_URL).host; 
 
 // Pre-fetch ElevenLabs signed URL for faster connection when call is answered
