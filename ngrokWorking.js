@@ -6,15 +6,17 @@ import Twilio from "twilio";
 import WebSocket from "ws";
 import fastifyCors from "@fastify/cors";
 
+// Load environment variables from .env file
 dotenv.config();
 
+// Check for required environment variables
 const {
   ELEVENLABS_API_KEY,
   ELEVENLABS_AGENT_ID,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
-  FORWARDING_PHONE_NUMBER,
+  FORWARDING_PHONE_NUMBER, // New environment variable for forwarding
 } = process.env;
 
 if (
@@ -33,76 +35,33 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// Cache for ElevenLabs signed URLs to avoid delay when call is answered
-const elevenLabsUrlCache = new Map();
-
-// Define this variable at the top of the file, after the other constants
-const IS_AWS_ENV =
-  process.env.NODE_ENV === "production" || process.env.IS_AWS === "true";
-
-// Pre-fetch ElevenLabs signed URL for faster connection when call is answered
-async function prefetchSignedUrl() {
-  try {
-    const signedUrl = await getSignedUrl();
-    const expiryTime = Date.now() + 1000 * 60 * 5; // URLs typically valid for ~10 min, keep for 5 min
-
-    // Store in cache with timestamp - Map.set doesn't return a Promise so don't call .catch on it
-    elevenLabsUrlCache.set("current", {
-      url: signedUrl,
-      expiryTime,
-    });
-
-    console.log("[ElevenLabs] Pre-fetched signed URL for future calls");
-    return signedUrl;
-  } catch (error) {
-    console.error("[ElevenLabs] Failed to pre-fetch signed URL:", error);
-    return null;
-  }
-}
-
-// Get a signed URL (from cache if available, otherwise fetch new one)
-async function getCachedSignedUrl() {
-  const cached = elevenLabsUrlCache.get("current");
-
-  if (cached && cached.expiryTime > Date.now()) {
-    console.log("[ElevenLabs] Using cached signed URL");
-    return cached.url;
-  }
-
-  console.log("[ElevenLabs] No valid cached URL, fetching new one...");
-  return prefetchSignedUrl();
-}
-
-// Initialize URL cache
-prefetchSignedUrl();
-// Refresh cache periodically
-setInterval(prefetchSignedUrl, 4 * 60 * 1000); // Refresh every 4 minutes
-
-// UPDATED CORS CONFIGURATION - more comprehensive
-await fastify.register(fastifyCors, {
-  // Allow specific origins instead of wildcard "*"
+fastify.register(fastifyCors, {
   origin: (origin, cb) => {
-    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) {
       return cb(null, true);
     }
 
+    // List of allowed origins
     const allowedOrigins = [
       "http://localhost:3000",
       "http://127.0.0.1:3000",
-      // Add your production domains here
-      "https://www.rankorbit.ai",
-
-      origin,
+      "https://rankorbit.ai",
+      origin, 
     ];
 
+    // Check if origin is in allowedOrigins
     if (allowedOrigins.includes(origin)) {
       return cb(null, true);
     }
 
-    return cb(null, true);
+    // Optional: For development, you can allow all origins
+    // return cb(null, true);
+
+    return cb(null, true); // Currently allowing all origins for development
   },
+  // Specify allowed methods
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+  // Specify allowed headers
   allowedHeaders: [
     "Origin",
     "X-Requested-With",
@@ -110,13 +69,19 @@ await fastify.register(fastifyCors, {
     "Accept",
     "Authorization",
   ],
+  // Expose these headers to the browser
   exposedHeaders: ["Content-Disposition"],
+  // Allow credentials (cookies, authorization headers)
   credentials: true,
+  // Cache preflight requests for 1 hour (3600 seconds)
   maxAge: 3600,
+  // Handle preflight success response
   preflightContinue: false,
+  // Success status for preflight responses
   optionsSuccessStatus: 204,
 });
 
+// Add new proxy endpoint to handle CORS issues
 fastify.post("/proxy-outbound-call", async (request, reply) => {
   const { number, prompt, first_message } = request.body;
 
@@ -125,6 +90,7 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
   }
 
   try {
+    // Create call with status callbacks
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to: number,
@@ -133,11 +99,13 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
       }/outbound-call-twiml?prompt=${encodeURIComponent(
         prompt
       )}&first_message=${encodeURIComponent(first_message)}`,
+      // Add status callback
       statusCallback: `https://${request.headers.host}/call-status-callback`,
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
       statusCallbackMethod: "POST",
     });
 
+    // Store call information
     activeCalls.set(call.sid, {
       callSid: call.sid,
       number,
@@ -147,6 +115,7 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
       first_message,
     });
 
+    // Broadcast call initiation to all clients
     broadcastCallUpdate({
       callSid: call.sid,
       number,
@@ -167,7 +136,7 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
   }
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 
 fastify.get("/", async (_, reply) => {
   reply.send({ message: "Server is running" });
@@ -175,10 +144,13 @@ fastify.get("/", async (_, reply) => {
 
 const twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
+// Track active calls and clients
 const activeCalls = new Map();
 const wsClients = new Set();
 
+// Function to detect if the user wants to speak to a human
 function shouldTransferToHuman(transcript) {
+  // Strip punctuation and convert to lowercase for more reliable matching
   const cleanTranscript = transcript
     .toLowerCase()
     .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "");
@@ -196,6 +168,7 @@ function shouldTransferToHuman(transcript) {
     "talk with a human",
   ];
 
+  // More aggressive matching - check if ANY of these phrases appear ANYWHERE in the transcript
   for (const phrase of transferPhrases) {
     if (cleanTranscript.includes(phrase)) {
       console.log(
@@ -205,6 +178,7 @@ function shouldTransferToHuman(transcript) {
     }
   }
 
+  // Also detect "speak with" or "talk with" or "talk to" or "speak to" patterns
   if (
     cleanTranscript.includes("speak with") ||
     cleanTranscript.includes("talk with") ||
@@ -222,18 +196,21 @@ function shouldTransferToHuman(transcript) {
   return false;
 }
 
+// Function to forward a call to a human representative
 async function forwardCallToHuman(callSid) {
   try {
     console.log(
       `[Twilio] ⚠️ FORWARDING CALL ${callSid} to human at ${FORWARDING_PHONE_NUMBER}`
     );
 
+    // Update the call status
     if (activeCalls.has(callSid)) {
       const callInfo = activeCalls.get(callSid);
       callInfo.status = "forwarding";
       callInfo.forwardingTime = new Date();
       callInfo.forwardingInProgress = true;
 
+      // Broadcast update to all clients
       broadcastCallUpdate({
         callSid,
         status: "forwarding",
@@ -242,6 +219,8 @@ async function forwardCallToHuman(callSid) {
       });
     }
 
+    // Use Twilio's API to update the call with new TwiML
+    // We're using a more direct TwiML that immediately dials without extra conversation
     const call = await twilioClient.calls(callSid).update({
       twiml: `<?xml version="1.0" encoding="UTF-8"?>
         <Response>
@@ -262,12 +241,14 @@ async function forwardCallToHuman(callSid) {
   } catch (error) {
     console.error(`[Twilio] ❌ Error forwarding call ${callSid}:`, error);
 
+    // Update the call status to indicate forwarding failed
     if (activeCalls.has(callSid)) {
       const callInfo = activeCalls.get(callSid);
-      callInfo.status = "completed";
+      callInfo.status = "completed"; // Mark as completed even if forwarding failed
       callInfo.completionReason = "forwarding_failed";
       callInfo.endTime = new Date();
 
+      // Broadcast the failure
       broadcastCallUpdate({
         callSid,
         status: "completed",
@@ -279,6 +260,7 @@ async function forwardCallToHuman(callSid) {
   }
 }
 
+// Function to broadcast call status updates to all connected clients
 function broadcastCallUpdate(callData) {
   const updateMessage = JSON.stringify({
     type: "call_status_update",
@@ -298,7 +280,6 @@ function broadcastCallUpdate(callData) {
 
 async function getSignedUrl() {
   try {
-    console.time("[ElevenLabs] Fetch signed URL");
     const response = await fetch(
       `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${ELEVENLABS_AGENT_ID}`,
       {
@@ -314,7 +295,6 @@ async function getSignedUrl() {
     }
 
     const data = await response.json();
-    console.timeEnd("[ElevenLabs] Fetch signed URL");
     return data.signed_url;
   } catch (error) {
     console.error("Error getting signed URL:", error);
@@ -322,8 +302,10 @@ async function getSignedUrl() {
   }
 }
 
+// Updated outbound-call endpoint to include status callbacks
+
 const recentCallAttempts = new Map();
-const CALL_COOLDOWN = 60000;
+const CALL_COOLDOWN = 60000; // 1 minute cooldown between calls to the same number
 
 fastify.post("/outbound-call", async (request, reply) => {
   const { number, prompt, first_message } = request.body;
@@ -332,6 +314,7 @@ fastify.post("/outbound-call", async (request, reply) => {
     return reply.code(400).send({ error: "Phone number is required" });
   }
 
+  // Check if we've recently attempted to call this number
   const now = Date.now();
   const lastAttempt = recentCallAttempts.get(number);
 
@@ -351,13 +334,16 @@ fastify.post("/outbound-call", async (request, reply) => {
     });
   }
 
+  // Record this attempt
   recentCallAttempts.set(number, now);
 
-  setTimeout(() => {
+  // Clean up old entries every hour
+  setTimeout(() => {z
     recentCallAttempts.delete(number);
-  }, 3600000);
+  }, 3600000); // 1 hour
 
   try {
+    // Create call with status callbacks
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to: number,
@@ -366,16 +352,17 @@ fastify.post("/outbound-call", async (request, reply) => {
       }/outbound-call-twiml?prompt=${encodeURIComponent(
         prompt
       )}&first_message=${encodeURIComponent(first_message)}`,
-
-      timeout: 15,
-      machineDetection: "DetectMessageEnd",
-      machineDetectionTimeout: 10,
-
+      // Set these parameters to reduce voicemail chances
+      timeout: 15, // Hang up if no answer after 15 seconds
+      machineDetection: "DetectMessageEnd", // Detect answering machines
+      machineDetectionTimeout: 10, // Wait up to 10 seconds for machine detection
+      // Add status callback
       statusCallback: `https://${request.headers.host}/call-status-callback`,
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
       statusCallbackMethod: "POST",
     });
 
+    // Store call information
     activeCalls.set(call.sid, {
       callSid: call.sid,
       number,
@@ -385,6 +372,7 @@ fastify.post("/outbound-call", async (request, reply) => {
       first_message,
     });
 
+    // Broadcast call initiation to all clients
     broadcastCallUpdate({
       callSid: call.sid,
       number,
@@ -404,7 +392,7 @@ fastify.post("/outbound-call", async (request, reply) => {
     });
   }
 });
-
+// Manual forwarding endpoint
 fastify.post("/forward-call/:callSid", async (request, reply) => {
   const { callSid } = request.params;
 
@@ -429,10 +417,12 @@ fastify.post("/forward-call/:callSid", async (request, reply) => {
   }
 });
 
+// New endpoint to check call status
 fastify.get("/call-status/:callSid", async (request, reply) => {
   const { callSid } = request.params;
 
   try {
+    // First check our local cache
     if (activeCalls.has(callSid)) {
       reply.send({
         success: true,
@@ -441,6 +431,7 @@ fastify.get("/call-status/:callSid", async (request, reply) => {
       return;
     }
 
+    // If not in cache, check with Twilio API
     const call = await twilioClient.calls(callSid).fetch();
 
     reply.send({
@@ -472,18 +463,16 @@ fastify.post("/call-status-callback", async (request, reply) => {
   );
   console.log(`[Twilio] Full callback data:`, request.body);
 
-  // When call is answered, immediately prefetch a signed URL if we don't have one
-  if (CallStatus === "in-progress") {
-    // Start prefetching URL in background to reduce delay
-    getCachedSignedUrl().catch(console.error);
-  }
-
+  // Update call status in our map
   if (activeCalls.has(CallSid)) {
     const callInfo = activeCalls.get(CallSid);
 
+    // Always update duration
     callInfo.duration = CallDuration || 0;
 
+    // Handle status update based on current state
     if (callInfo.status === "forwarding" && CallStatus === "completed") {
+      // Call was forwarded and now completed
       callInfo.status = "completed";
       callInfo.completionReason =
         callInfo.completionReason || "forwarded_call_ended";
@@ -493,6 +482,7 @@ fastify.post("/call-status-callback", async (request, reply) => {
         CallStatus
       )
     ) {
+      // Normal call completion states
       callInfo.status = CallStatus;
       callInfo.endTime = new Date();
 
@@ -500,14 +490,17 @@ fastify.post("/call-status-callback", async (request, reply) => {
         `[Twilio] Call ${CallSid} reached terminal state: ${CallStatus}`
       );
 
+      // Remove call from active calls after some time
       setTimeout(() => {
         console.log(`[Twilio] Removing call ${CallSid} from active calls map`);
         activeCalls.delete(CallSid);
-      }, 3600000);
+      }, 3600000); // Keep for 1 hour
     } else {
+      // Other status updates
       callInfo.status = CallStatus;
     }
 
+    // Broadcast update to all clients
     broadcastCallUpdate({
       callSid: CallSid,
       status: callInfo.status,
@@ -520,6 +513,7 @@ fastify.post("/call-status-callback", async (request, reply) => {
   reply.send({ success: true });
 });
 
+// Add endpoint to end a call
 fastify.post("/end-call/:callSid", async (request, reply) => {
   const { callSid } = request.params;
 
@@ -528,16 +522,19 @@ fastify.post("/end-call/:callSid", async (request, reply) => {
   }
 
   try {
+    // Try to end the call via Twilio API
     await twilioClient.calls(callSid).update({
       status: "completed",
     });
 
+    // Update our local tracking
     if (activeCalls.has(callSid)) {
       const callInfo = activeCalls.get(callSid);
       callInfo.status = "completed";
       callInfo.endTime = new Date();
       callInfo.manuallyEnded = true;
 
+      // Broadcast the update
       broadcastCallUpdate({
         callSid,
         status: "completed",
@@ -558,204 +555,53 @@ fastify.post("/end-call/:callSid", async (request, reply) => {
   }
 });
 
-// Helper function to get the appropriate base URL based on environment
-function getPublicBaseUrl(request) {
-  const raw = process.env.PUBLIC_HOST_URL || request.headers.host;
-  return raw.replace(/^https?:\/\//, "");
-}
-
-const STREAM_URL = process.env.STREAM_URL;
-
 fastify.all("/outbound-call-twiml", async (request, reply) => {
-  console.log(`[TwiML] request for stream TwiML from ${request.ip}`);
+  const prompt = request.query.prompt || "";
+  const first_message = request.query.first_message || "";
 
-  const prompt = request.query.prompt || ""
-  const first_message = request.query.first_message || ""
-
-  console.log(
-    `[TwiML] Prompt: "${prompt}", First message: "${first_message}"`
-  );
-
-
-  // build ws URL from your HTTP/HTTPS base
-  // const raw = getPublicBaseUrl(request)
-
-  console.log(`[Twilio] Raw URL: ${raw}`)
-  // const streamUrl = origin.replace(/^http/, "ws") + "/outbound-media-stream";
-
-
-  console.log(`[Twilio] Stream URL → ${streamUrl}`)
-
+  // Simplified TwiML - direct connection to the media stream without Gather blocks
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-      <Connect>
-        <Stream url="${STREAM_URL}">
-          <Parameter name="prompt" value="${prompt}" />
-          <Parameter name="first_message" value="${first_message}" />
-        </Stream>
-      </Connect>
-    </Response>`
+        <Connect>
+            <Stream url="wss://${request.headers.host}/outbound-media-stream">
+                <Parameter name="prompt" value="${prompt}" />
+                <Parameter name="first_message" value="${first_message}" />
+            </Stream>
+        </Connect>
+    </Response>`;
 
-  reply.type("text/xml").send(twimlResponse)
-})
-
-// Create a diagnostic endpoint to verify WebSocket functionality
-fastify.get("/diagnostics", async (request, reply) => {
-  try {
-    // Check if we can get a signed URL from ElevenLabs
-    console.log("[Diagnostics] Testing ElevenLabs signed URL");
-    let elevenLabsUrl = null;
-    try {
-      elevenLabsUrl = await getSignedUrl();
-      console.log("[Diagnostics] Successfully obtained ElevenLabs signed URL");
-    } catch (error) {
-      console.error(
-        "[Diagnostics] Failed to get ElevenLabs signed URL:",
-        error
-      );
-    }
-
-    // Check environment variables
-    const envCheck = {
-      ELEVENLABS_API_KEY: !!ELEVENLABS_API_KEY,
-      ELEVENLABS_AGENT_ID: !!ELEVENLABS_AGENT_ID,
-      TWILIO_ACCOUNT_SID: !!TWILIO_ACCOUNT_SID,
-      TWILIO_AUTH_TOKEN: !!TWILIO_AUTH_TOKEN,
-      TWILIO_PHONE_NUMBER: !!TWILIO_PHONE_NUMBER,
-      FORWARDING_PHONE_NUMBER: !!FORWARDING_PHONE_NUMBER,
-      IS_AWS_ENV: IS_AWS_ENV,
-      PORT: PORT,
-      PUBLIC_HOST_URL: process.env.PUBLIC_HOST_URL || "Not set",
-    };
-
-    reply.send({
-      status: "ok",
-      time: new Date().toISOString(),
-      environment: IS_AWS_ENV ? "aws" : "local",
-      host: request.headers.host,
-      elevenlabsUrlTest: !!elevenLabsUrl,
-      environmentVariables: envCheck,
-      activeWebSocketClients: wsClients.size,
-      activeCalls: activeCalls.size,
-      memoryUsage: process.memoryUsage(),
-    });
-  } catch (error) {
-    console.error("[Diagnostics] Error generating diagnostics:", error);
-    reply.code(500).send({
-      status: "error",
-      message: "Error generating diagnostics",
-      error: error.message,
-    });
-  }
+  reply.type("text/xml").send(twimlResponse);
 });
 
-// Configure Fastify for AWS Elastic Beanstalk
+// ElevenLabs WebSocket handler
 fastify.register(async (fastifyInstance) => {
   fastifyInstance.get(
     "/outbound-media-stream",
-    {
-      websocket: true,
-      wsOptions: {
-        // Increase timeouts for AWS environment
-        pingInterval: 30000, // 30 seconds
-        pingTimeout: 60000, // 60 seconds
-        // Add any other necessary WebSocket server options
-        perMessageDeflate: false, // Disable compression which can sometimes cause issues
-      },
-    },
+    { websocket: true },
     (ws, req) => {
       console.info("[Server] Twilio connected to outbound media stream");
-
-      // Add ping/pong to keep connection alive on AWS
-      const pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.ping();
-            console.log("[WebSocket] Sent ping to keep connection alive");
-          } catch (error) {
-            console.error("[WebSocket] Error sending ping:", error);
-          }
-        } else {
-          clearInterval(pingTimer);
-        }
-      }, 30000); // Every 30 seconds
 
       let streamSid = null;
       let callSid = null;
       let elevenLabsWs = null;
       let customParameters = null;
       let conversationEnded = false;
-      let elevenLabsSetupStarted = false;
 
-      ws.on("error", (error) => {
-        console.error("[WebSocket] Twilio stream error:", error);
-      });
+      ws.on("error", console.error);
 
-      const setupElevenLabs = async (useCache = true) => {
-        if (elevenLabsSetupStarted) {
-          console.log(
-            "[ElevenLabs] Setup already in progress, skipping duplicate setup"
-          );
-          return;
-        }
-
-        elevenLabsSetupStarted = true;
-        console.time("[Call Flow] ElevenLabs setup");
-
+      const setupElevenLabs = async () => {
         try {
-          // Use cached URL if available to reduce delay
-          const signedUrl = useCache
-            ? await getCachedSignedUrl()
-            : await getSignedUrl();
-
-          console.log(
-            "[ElevenLabs] Got signed URL, establishing connection..."
-          );
-
-          // Add additional WebSocket connection options for stability in AWS environment
-          const wsOptions = {
-            handshakeTimeout: 15000, // 15 seconds
-            headers: {
-              "User-Agent": "Rankorbit-AI-Agent/1.0",
-            },
-          };
-
-          elevenLabsWs = new WebSocket(signedUrl, wsOptions);
-
-          // Add specific error event handler for connection issues
-          elevenLabsWs.on("error", (error) => {
-            console.error("[ElevenLabs] WebSocket connection error:", error);
-            elevenLabsSetupStarted = false; // Reset so we can try again
-          });
-
-          // Add connection timeout handling
-          const connectionTimeout = setTimeout(() => {
-            if (elevenLabsWs.readyState !== WebSocket.OPEN) {
-              console.error("[ElevenLabs] Connection timed out");
-              elevenLabsWs.terminate();
-              elevenLabsSetupStarted = false;
-            }
-          }, 15000);
+          const signedUrl = await getSignedUrl();
+          elevenLabsWs = new WebSocket(signedUrl);
 
           elevenLabsWs.on("open", () => {
-            clearTimeout(connectionTimeout);
-            console.timeEnd("[Call Flow] ElevenLabs setup");
             console.log("[ElevenLabs] Connected to Conversational AI");
 
-            // If we have parameters already, send them immediately
-            if (customParameters) {
-              sendInitialConfig();
-            }
-          });
-
-          // Function to send initial config to ElevenLabs
-          function sendInitialConfig() {
-            console.time("[Call Flow] Initial config to first audio");
             const initialConfig = {
               type: "conversation_initiation_client_data",
               dynamic_variables: {
-                user_name: "User",
-                user_id: Math.floor(Math.random() * 10000),
+                user_name: "User", // More generic name
+                user_id: Math.floor(Math.random() * 10000), // Random ID to avoid conflicts
               },
               conversation_config_override: {
                 agent: {
@@ -777,53 +623,61 @@ fastify.register(async (fastifyInstance) => {
             );
 
             elevenLabsWs.send(JSON.stringify(initialConfig));
-          }
+          });
 
           elevenLabsWs.on("message", (data) => {
             try {
               const message = JSON.parse(data);
-
+          
               switch (message.type) {
                 case "conversation_initiation_metadata":
                   console.log("[ElevenLabs] Received initiation metadata");
                   break;
-
+          
                 case "audio":
-                  // Log timing for first audio chunk received
-                  if (!elevenLabsWs.receivedFirstAudio) {
-                    console.timeEnd(
-                      "[Call Flow] Initial config to first audio"
-                    );
-                    elevenLabsWs.receivedFirstAudio = true;
-                  }
-
                   if (streamSid) {
+                    console.log("[ElevenLabs] Audio message received, format properties:", 
+                      JSON.stringify({
+                        hasAudioChunk: !!message.audio?.chunk,
+                        hasAudioEventBase64: !!message.audio_event?.audio_base_64,
+                        messageKeys: Object.keys(message)
+                      })
+                    );
+                    
+                    // Try to determine the audio structure
+                    let payload = null;
+                    
                     if (message.audio?.chunk) {
-                      const audioData = {
-                        event: "media",
-                        streamSid,
-                        media: {
-                          payload: message.audio.chunk,
-                        },
-                      };
-                      ws.send(JSON.stringify(audioData));
+                      payload = message.audio.chunk;
+                      console.log("[ElevenLabs] Using audio.chunk format");
                     } else if (message.audio_event?.audio_base_64) {
+                      payload = message.audio_event.audio_base_64;
+                      console.log("[ElevenLabs] Using audio_event.audio_base_64 format");
+                    } else if (typeof message.audio === 'string') {
+                      payload = message.audio;
+                      console.log("[ElevenLabs] Using direct audio string format");
+                    } else if (message.chunk) {
+                      payload = message.chunk;
+                      console.log("[ElevenLabs] Using direct chunk format");
+                    }
+                    
+                    if (payload) {
                       const audioData = {
                         event: "media",
                         streamSid,
                         media: {
-                          payload: message.audio_event.audio_base_64,
+                          payload: payload,
                         },
                       };
                       ws.send(JSON.stringify(audioData));
+                    } else {
+                      console.log("[ElevenLabs] Could not determine audio payload format:", message);
                     }
                   } else {
-                    console.log(
-                      "[ElevenLabs] Received audio but no StreamSid yet"
-                    );
+                    console.log("[ElevenLabs] Received audio but no StreamSid yet");
                   }
                   break;
-
+          
                 case "interruption":
                   if (streamSid) {
                     ws.send(
@@ -834,8 +688,7 @@ fastify.register(async (fastifyInstance) => {
                     );
                   }
                   break;
-
-                // Add other cases for message types
+          
                 case "ping":
                   if (message.ping_event?.event_id) {
                     elevenLabsWs.send(
@@ -846,37 +699,41 @@ fastify.register(async (fastifyInstance) => {
                     );
                   }
                   break;
-
+          
                 case "agent_response":
                   console.log(
                     `[Twilio] Agent response: ${message.agent_response_event?.agent_response}`
                   );
                   break;
-
+          
                 case "user_transcript":
                   const userTranscript =
                     message.user_transcription_event?.user_transcript || "";
                   console.log(`[Twilio] User transcript: "${userTranscript}"`);
-
-                  if (shouldTransferToHuman(userTranscript) && callSid) {
+          
+                  // Check if user wants to talk to a human - with enhanced logging
+                  if (shouldTransferToHuman(userTranscript)) {
                     console.log(
                       `[Twilio] ✓ TRANSFER REQUESTED: "${userTranscript}"`
                     );
-
+          
+                    // Let the AI say goodbye
                     if (elevenLabsWs?.readyState === WebSocket.OPEN) {
                       console.log(`[Twilio] Sending interrupt to ElevenLabs`);
-
+          
                       elevenLabsWs.send(
                         JSON.stringify({
                           type: "interrupt",
                         })
                       );
-
+          
+                      // Wait a short time for any current audio to finish
                       setTimeout(() => {
+                        // Send a message to ElevenLabs to say goodbye
                         console.log(
                           `[Twilio] Sending transfer message to ElevenLabs`
                         );
-
+          
                         elevenLabsWs.send(
                           JSON.stringify({
                             type: "user_message",
@@ -886,7 +743,9 @@ fastify.register(async (fastifyInstance) => {
                             },
                           })
                         );
-
+          
+                        // Immediately initiate the forwarding process with a shorter delay
+                        // Don't wait for AI to respond, as it may not
                         setTimeout(async () => {
                           try {
                             console.log(
@@ -899,9 +758,10 @@ fastify.register(async (fastifyInstance) => {
                               error
                             );
                           }
-                        }, 2000);
+                        }, 2000); // Reduced from 5000 to 2000
                       }, 300);
                     } else {
+                      // If ElevenLabs connection isn't open, forward immediately
                       console.log(
                         `[Twilio] ElevenLabs not connected, forwarding immediately`
                       );
@@ -909,15 +769,17 @@ fastify.register(async (fastifyInstance) => {
                     }
                   }
                   break;
-
+          
                 case "conversation_ended":
                   console.log(`[ElevenLabs] Conversation ended`);
                   conversationEnded = true;
-
+          
+                  // Update call status if possible
                   if (callSid && activeCalls.has(callSid)) {
                     const callInfo = activeCalls.get(callSid);
                     callInfo.conversationEnded = true;
-
+          
+                    // Broadcast this information
                     broadcastCallUpdate({
                       callSid,
                       status: "conversation_ended",
@@ -925,7 +787,7 @@ fastify.register(async (fastifyInstance) => {
                     });
                   }
                   break;
-
+          
                 default:
                   console.log(
                     `[ElevenLabs] Unhandled message type: ${message.type}`
@@ -935,13 +797,45 @@ fastify.register(async (fastifyInstance) => {
               console.error("[ElevenLabs] Error processing message:", error);
             }
           });
+
+          elevenLabsWs.on("error", (error) => {
+            console.error("[ElevenLabs] WebSocket error:", error);
+          });
+
+          elevenLabsWs.on("close", () => {
+            console.log("[ElevenLabs] Disconnected");
+
+            // Update call status if possible
+            if (callSid && activeCalls.has(callSid)) {
+              const callInfo = activeCalls.get(callSid);
+              callInfo.elevenLabsDisconnected = true;
+
+              // If the call is in forwarding state, mark it as completed when ElevenLabs disconnects
+              if (callInfo.status === "forwarding") {
+                callInfo.status = "completed";
+                callInfo.completionReason = "forwarded_to_human";
+                callInfo.endTime = new Date();
+              } else {
+                // THIS IS THE CHANGE: Set status to 'completed' when ElevenLabs disconnects
+                callInfo.status = "completed";
+                callInfo.endTime = new Date();
+                callInfo.completionReason = "elevenlabs_disconnected";
+              }
+
+              // Broadcast this information with the updated status
+              broadcastCallUpdate({
+                callSid,
+                status: callInfo.status,
+                elevenLabsDisconnected: true,
+                completionReason: callInfo.completionReason,
+              });
+            }
+          });
         } catch (error) {
           console.error("[ElevenLabs] Setup error:", error);
-          elevenLabsSetupStarted = false; // Allow retry on failure
         }
       };
 
-      // Start ElevenLabs setup as soon as Twilio connects
       setupElevenLabs();
 
       ws.on("message", (message) => {
@@ -952,13 +846,7 @@ fastify.register(async (fastifyInstance) => {
           }
 
           switch (msg.event) {
-            case "connected":
-              // Handle the previously unhandled "connected" event
-              console.log("[Twilio] Media stream connected");
-              break;
-
             case "start":
-              console.time("[Call Flow] Start event to ElevenLabs ready");
               streamSid = msg.start.streamSid;
               callSid = msg.start.callSid;
               customParameters = msg.start.customParameters;
@@ -967,40 +855,13 @@ fastify.register(async (fastifyInstance) => {
               );
               console.log("[Twilio] Start parameters:", customParameters);
 
-              // Send config if ElevenLabs is already connected
-              if (elevenLabsWs?.readyState === WebSocket.OPEN) {
-                console.log(
-                  "[ElevenLabs] Connection already open, sending config immediately"
-                );
-                // Send initial config
-                elevenLabsWs.send(
-                  JSON.stringify({
-                    type: "conversation_initiation_client_data",
-                    dynamic_variables: {
-                      user_name: "User",
-                      user_id: Math.floor(Math.random() * 10000),
-                    },
-                    conversation_config_override: {
-                      agent: {
-                        prompt: {
-                          prompt:
-                            customParameters?.prompt ||
-                            "you are a gary from the phone store",
-                        },
-                        first_message:
-                          customParameters?.first_message ||
-                          "hey there! how can I help you today?",
-                      },
-                    },
-                  })
-                );
-              }
-
+              // Update call status if we have it
               if (activeCalls.has(callSid)) {
                 const callInfo = activeCalls.get(callSid);
                 callInfo.status = "in-progress";
                 callInfo.streamSid = streamSid;
 
+                // Broadcast update
                 broadcastCallUpdate({
                   callSid,
                   status: "in-progress",
@@ -1024,12 +885,14 @@ fastify.register(async (fastifyInstance) => {
             case "stop":
               console.log(`[Twilio] Stream ${streamSid} ended`);
 
+              // Update call status if possible
               if (callSid && activeCalls.has(callSid)) {
                 const callInfo = activeCalls.get(callSid);
                 callInfo.streamEnded = true;
-                callInfo.status = "completed";
+                callInfo.status = "completed"; // Mark call as completed when Twilio stops
                 callInfo.endTime = new Date();
 
+                // Broadcast this information
                 broadcastCallUpdate({
                   callSid,
                   status: "completed",
@@ -1053,12 +916,14 @@ fastify.register(async (fastifyInstance) => {
       ws.on("close", () => {
         console.log("[Twilio] Client disconnected from outbound media stream");
 
+        // Update call status if possible
         if (callSid && activeCalls.has(callSid)) {
           const callInfo = activeCalls.get(callSid);
           callInfo.twilioDisconnected = true;
           callInfo.status = "completed";
           callInfo.endTime = new Date();
 
+          // Broadcast this information
           broadcastCallUpdate({
             callSid,
             status: "completed",
@@ -1074,6 +939,7 @@ fastify.register(async (fastifyInstance) => {
   );
 });
 
+// Add WebSocket endpoint for call status updates
 fastify.register(async (fastifyInstance) => {
   fastifyInstance.get(
     "/call-status-ws",
@@ -1081,8 +947,10 @@ fastify.register(async (fastifyInstance) => {
     (connection, req) => {
       console.log("[Server] Client connected to call status WebSocket");
 
+      // Add to clients list
       wsClients.add(connection);
 
+      // Send initial active calls data
       if (activeCalls.size > 0) {
         const activeCallsData = Array.from(activeCalls.values());
         connection.send(
@@ -1094,6 +962,7 @@ fastify.register(async (fastifyInstance) => {
       }
 
       connection.on("message", (message) => {
+        // Handle any client messages if needed
         console.log(
           "[WebSocket] Received message from client:",
           message.toString()
@@ -1110,9 +979,10 @@ fastify.register(async (fastifyInstance) => {
 
 function cleanupStalledCalls() {
   const now = new Date();
-  const MAX_CALL_DURATION = 15 * 60 * 1000;
+  const MAX_CALL_DURATION = 15 * 60 * 1000; // 15 minutes in milliseconds
 
   for (const [callSid, callInfo] of activeCalls.entries()) {
+    // Skip calls that are already completed
     if (
       ["completed", "busy", "failed", "no-answer", "canceled"].includes(
         callInfo.status
@@ -1124,6 +994,7 @@ function cleanupStalledCalls() {
     const startTime = new Date(callInfo.startTime);
     const callDuration = now - startTime;
 
+    // If call has been going for more than MAX_CALL_DURATION, mark it as completed
     if (callDuration > MAX_CALL_DURATION) {
       console.log(
         `[Server] Auto-completing stalled call ${callSid} after ${
@@ -1135,12 +1006,14 @@ function cleanupStalledCalls() {
       callInfo.completionReason = "timed_out";
       callInfo.endTime = now;
 
+      // Broadcast update
       broadcastCallUpdate({
         callSid,
         status: "completed",
         completionReason: "timed_out",
       });
 
+      // Try to end the call via Twilio
       twilioClient
         .calls(callSid)
         .update({
@@ -1158,10 +1031,12 @@ function cleanupStalledCalls() {
 
 setInterval(cleanupStalledCalls, 60000);
 
+// Add health check endpoint
 fastify.get("/health", async (_, reply) => {
   reply.send({ status: "ok", time: new Date().toISOString() });
 });
 
+// Start the server
 fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
   if (err) {
     console.error("Error starting server:", err);
