@@ -133,12 +133,10 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to: number,
-      url: `https://${
-        request.headers.host
-      }/outbound-call-twiml?prompt=${encodeURIComponent(
+      url: `${PUBLIC_HOST_URL_}/outbound-call-twiml?prompt=${encodeURIComponent(
         prompt
       )}&first_message=${encodeURIComponent(first_message)}`,
-      statusCallback: `https://${request.headers.host}/call-status-callback`,
+      statusCallback: `https://${PUBLIC_HOST_URL_}/call-status-callback`,
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
       statusCallbackMethod: "POST",
     });
