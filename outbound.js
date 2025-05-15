@@ -29,7 +29,9 @@ if (
   throw new Error("Missing required environment variables");
 }
 
-const fastify = Fastify();
+const fastify = Fastify({
+  trustProxy: true, // Add this line
+});
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
@@ -39,6 +41,9 @@ const elevenLabsUrlCache = new Map();
 // Define this variable at the top of the file, after the other constants
 const IS_AWS_ENV =
   process.env.NODE_ENV === "production" || process.env.IS_AWS === "true";
+
+PUBLIC_URL = "https://auto-dialer-production-env.eba-bcakpgwm.us-west-2.elasticbeanstalk.com"
+const PUBLIC_HOST_URL_ = new URL(PUBLIC_URL).host; 
 
 // Pre-fetch ElevenLabs signed URL for faster connection when call is answered
 async function prefetchSignedUrl() {
@@ -361,9 +366,7 @@ fastify.post("/outbound-call", async (request, reply) => {
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to: number,
-      url: `https://${
-        request.headers.host
-      }/outbound-call-twiml?prompt=${encodeURIComponent(
+      url: `${PUBLIC_HOST_URL_}/outbound-call-twiml?prompt=${encodeURIComponent(
         prompt
       )}&first_message=${encodeURIComponent(first_message)}`,
 
@@ -371,7 +374,8 @@ fastify.post("/outbound-call", async (request, reply) => {
       machineDetection: "DetectMessageEnd",
       machineDetectionTimeout: 10,
 
-      statusCallback: `https://${request.headers.host}/call-status-callback`,
+      // statusCallback: `https://${request.headers.host}/call-status-callback`,
+      statusCallback: `${PUBLIC_HOST_URL_}/call-status-callback`,
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
       statusCallbackMethod: "POST",
     });
@@ -564,7 +568,7 @@ function getPublicBaseUrl(request) {
   return raw.replace(/^https?:\/\//, "");
 }
 
-const STREAM_URL = process.env.STREAM_URL;
+const STREAM_URL = `wss://${PUBLIC_HOST_URL_}/outbound-media-stream`;
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
   console.log(`[TwiML] request for stream TwiML from ${request.ip}`);
