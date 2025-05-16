@@ -568,7 +568,7 @@ function getPublicBaseUrl(request) {
   return raw.replace(/^https?:\/\//, "");
 }
 
-const STREAM_URL = `wss://thedealhunterapp.com/outbound-media-stream`;
+const STREAM_URL = `wss://${PUBLIC_HOST_URL_}/outbound-media-stream`;
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
   console.log(`[TwiML] request for stream TwiML from ${request.ip}`);
