@@ -32,6 +32,7 @@ if (
 const fastify = Fastify({
   trustProxy: true, // Add this line
     logger: true, // Enable logging for debugging
+
 });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
@@ -43,7 +44,7 @@ const elevenLabsUrlCache = new Map();
 const IS_AWS_ENV =
   process.env.NODE_ENV === "production" || process.env.IS_AWS === "true";
 
-const PUBLIC_HOST_URL_ = new URL(process.env.PUBLIC_HOST_URL).host;
+const PUBLIC_HOST_URL_ = process.env.PUBLIC_HOST_URL; // Keep full URL
 
 
 // Pre-fetch ElevenLabs signed URL for faster connection when call is answered
@@ -567,7 +568,7 @@ function getPublicBaseUrl(request) {
   return raw.replace(/^https?:\/\//, "");
 }
 
-const STREAM_URL = `wss://${PUBLIC_HOST_URL_}/outbound-media-stream`;
+const STREAM_URL = `wss://thedealhunterapp.com/outbound-media-stream`;
 
 fastify.all("/outbound-call-twiml", async (request, reply) => {
   console.log(`[TwiML] request for stream TwiML from ${request.ip}`);
