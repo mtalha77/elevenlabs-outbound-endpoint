@@ -47,21 +47,6 @@ async function prefetchSignedUrl() {
       url: signedUrl,
       expiryTime,
     });
-    
-    // OPTIMIZATION: Add a backup URL that's slightly newer
-    // This helps when there are multiple calls in quick succession
-    setTimeout(async () => {
-      try {
-        const backupUrl = await getSignedUrl();
-        elevenLabsUrlCache.set("backup", {
-          url: backupUrl,
-          expiryTime: Date.now() + 1000 * 60 * 5,
-        });
-        console.log("[ElevenLabs] Pre-fetched backup signed URL");
-      } catch (error) {
-        console.error("[ElevenLabs] Failed to pre-fetch backup URL:", error);
-      }
-    }, 10000); // 10 seconds later
 
     console.log("[ElevenLabs] Pre-fetched signed URL for future calls");
     return signedUrl;
@@ -71,35 +56,23 @@ async function prefetchSignedUrl() {
   }
 }
 
-
 // Get a signed URL (from cache if available, otherwise fetch new one)
 async function getCachedSignedUrl() {
   const cached = elevenLabsUrlCache.get("current");
-  const backup = elevenLabsUrlCache.get("backup");
 
-  // OPTIMIZATION: Use backup if primary is close to expiry
-  if (cached && cached.expiryTime > Date.now() + 60000) { // Has at least 1 minute left
+  if (cached && cached.expiryTime > Date.now()) {
     console.log("[ElevenLabs] Using cached signed URL");
     return cached.url;
-  } else if (backup && backup.expiryTime > Date.now() + 60000) {
-    console.log("[ElevenLabs] Using backup signed URL");
-    // Promote backup to current
-    elevenLabsUrlCache.set("current", backup);
-    elevenLabsUrlCache.delete("backup");
-    // Start fetching a new backup
-    setTimeout(() => prefetchSignedUrl(), 1000);
-    return backup.url;
   }
 
   console.log("[ElevenLabs] No valid cached URL, fetching new one...");
   return prefetchSignedUrl();
 }
 
-// OPTIMIZATION: More aggressive refresh cycle
 // Initialize URL cache
 prefetchSignedUrl();
-// Refresh cache more frequently (every 2 minutes instead of 4)
-setInterval(prefetchSignedUrl, 2 * 60 * 1000);
+// Refresh cache periodically
+setInterval(prefetchSignedUrl, 4 * 60 * 1000); // Refresh every 4 minutes
 
 // UPDATED CORS CONFIGURATION - more comprehensive
 await fastify.register(fastifyCors, {
@@ -387,10 +360,6 @@ fastify.post("/outbound-call", async (request, reply) => {
     recentCallAttempts.delete(number);
   }, 3600000);
 
-  // OPTIMIZATION: Start prefetching ElevenLabs connection immediately
-  // This gives us a head start before the call is even dialed
-  const signedUrlPromise = getCachedSignedUrl();
-
   try {
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
@@ -417,8 +386,6 @@ fastify.post("/outbound-call", async (request, reply) => {
       startTime: new Date(),
       prompt,
       first_message,
-      // OPTIMIZATION: Store the promise for the signed URL
-      signedUrlPromise
     });
 
     broadcastCallUpdate({
@@ -440,7 +407,6 @@ fastify.post("/outbound-call", async (request, reply) => {
     });
   }
 });
-
 
 fastify.post("/forward-call/:callSid", async (request, reply) => {
   const { callSid } = request.params;
@@ -507,23 +473,12 @@ fastify.post("/call-status-callback", async (request, reply) => {
       AnsweredBy || "unknown"
     }`
   );
+  console.log(`[Twilio] Full callback data:`, request.body);
 
-  // When call is answered, immediately prioritize connection setup
+  // When call is answered, immediately prefetch a signed URL if we don't have one
   if (CallStatus === "in-progress") {
-    // OPTIMIZATION: Aggressively ensure we have a connection ready
-    // Use the stored promise if available or get a fresh URL
-    if (activeCalls.has(CallSid)) {
-      const callInfo = activeCalls.get(CallSid);
-      // Use the existing promise or create a new one
-      if (!callInfo.signedUrlPromise) {
-        callInfo.signedUrlPromise = getCachedSignedUrl().catch(console.error);
-      }
-      // Mark the call as answered to help WebSocket prioritize setup
-      callInfo.answered = true;
-    } else {
-      // Fallback if we don't have the call info
-      getCachedSignedUrl().catch(console.error);
-    }
+    // Start prefetching URL in background to reduce delay
+    getCachedSignedUrl().catch(console.error);
   }
 
   if (activeCalls.has(CallSid)) {
@@ -636,8 +591,6 @@ fastify.register(async (fastifyInstance) => {
       let customParameters = null;
       let conversationEnded = false;
       let elevenLabsSetupStarted = false;
-      let elevenLabsConnected = false;
-      let initialConfigSent = false;
 
       ws.on("error", console.error);
 
@@ -653,20 +606,10 @@ fastify.register(async (fastifyInstance) => {
         console.time("[Call Flow] ElevenLabs setup");
 
         try {
-          // OPTIMIZATION: Check if we already have a Promise for the URL from the call setup
-          let signedUrlPromise;
-          
-          if (callSid && activeCalls.has(callSid) && activeCalls.get(callSid).signedUrlPromise) {
-            console.log("[ElevenLabs] Using pre-fetched URL from call setup");
-            signedUrlPromise = activeCalls.get(callSid).signedUrlPromise;
-          } else {
-            // Use cached URL if available to reduce delay
-            signedUrlPromise = useCache
-              ? getCachedSignedUrl()
-              : getSignedUrl();
-          }
-
-          const signedUrl = await signedUrlPromise;
+          // Use cached URL if available to reduce delay
+          const signedUrl = useCache
+            ? await getCachedSignedUrl()
+            : await getSignedUrl();
 
           console.log(
             "[ElevenLabs] Got signed URL, establishing connection..."
@@ -676,21 +619,15 @@ fastify.register(async (fastifyInstance) => {
           elevenLabsWs.on("open", () => {
             console.timeEnd("[Call Flow] ElevenLabs setup");
             console.log("[ElevenLabs] Connected to Conversational AI");
-            elevenLabsConnected = true;
 
             // If we have parameters already, send them immediately
-            if (customParameters && !initialConfigSent) {
+            if (customParameters) {
               sendInitialConfig();
             }
           });
 
-          // OPTIMIZATION: More efficient initial config - prepare once, send when ready
+          // Function to send initial config to ElevenLabs
           function sendInitialConfig() {
-            if (initialConfigSent) {
-              console.log("[ElevenLabs] Initial config already sent, skipping");
-              return;
-            }
-            
             console.time("[Call Flow] Initial config to first audio");
             const initialConfig = {
               type: "conversation_initiation_client_data",
@@ -718,7 +655,6 @@ fastify.register(async (fastifyInstance) => {
             );
 
             elevenLabsWs.send(JSON.stringify(initialConfig));
-            initialConfigSent = true;
           }
 
           elevenLabsWs.on("message", (data) => {
@@ -766,7 +702,6 @@ fastify.register(async (fastifyInstance) => {
                   }
                   break;
 
-                // Other message handling remains the same...
                 case "interruption":
                   if (streamSid) {
                     ws.send(
@@ -884,7 +819,6 @@ fastify.register(async (fastifyInstance) => {
 
           elevenLabsWs.on("close", () => {
             console.log("[ElevenLabs] Disconnected");
-            elevenLabsConnected = false;
 
             if (callSid && activeCalls.has(callSid)) {
               const callInfo = activeCalls.get(callSid);
@@ -911,12 +845,10 @@ fastify.register(async (fastifyInstance) => {
         } catch (error) {
           console.error("[ElevenLabs] Setup error:", error);
           elevenLabsSetupStarted = false; // Allow retry on failure
-          elevenLabsConnected = false;
         }
       };
 
-      // OPTIMIZATION: Start ElevenLabs setup as soon as Twilio connects
-      // This gives us a head start before the call is even answered
+      // Start ElevenLabs setup as soon as Twilio connects
       setupElevenLabs();
 
       ws.on("message", (message) => {
@@ -942,24 +874,39 @@ fastify.register(async (fastifyInstance) => {
               );
               console.log("[Twilio] Start parameters:", customParameters);
 
-              // OPTIMIZATION: Check if we already have ElevenLabs connection
-              if (elevenLabsConnected && !initialConfigSent) {
+              // Send config if ElevenLabs is already connected
+              if (elevenLabsWs?.readyState === WebSocket.OPEN) {
                 console.log(
                   "[ElevenLabs] Connection already open, sending config immediately"
                 );
                 // Send initial config
-                sendInitialConfig();
-              } else if (!elevenLabsSetupStarted) {
-                // If we somehow don't have a connection yet, start one urgently
-                console.log("[ElevenLabs] No connection yet, starting setup urgently");
-                setupElevenLabs(false); // Skip cache to get freshest URL
+                elevenLabsWs.send(
+                  JSON.stringify({
+                    type: "conversation_initiation_client_data",
+                    dynamic_variables: {
+                      user_name: "User",
+                      user_id: Math.floor(Math.random() * 10000),
+                    },
+                    conversation_config_override: {
+                      agent: {
+                        prompt: {
+                          prompt:
+                            customParameters?.prompt ||
+                            "you are a gary from the phone store",
+                        },
+                        first_message:
+                          customParameters?.first_message ||
+                          "hey there! how can I help you today?",
+                      },
+                    },
+                  })
+                );
               }
 
               if (activeCalls.has(callSid)) {
                 const callInfo = activeCalls.get(callSid);
                 callInfo.status = "in-progress";
                 callInfo.streamSid = streamSid;
-                callInfo.answered = true;
 
                 broadcastCallUpdate({
                   callSid,
