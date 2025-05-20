@@ -138,18 +138,19 @@ fastify.post("/proxy-outbound-call", async (request, reply) => {
   }
 
   try {
-    const call = await twilioClient.calls.create({
-      from: TWILIO_PHONE_NUMBER,
-      to: number,
-      url: `https://${
-        request.headers.host
-      }/outbound-call-twiml?prompt=${encodeURIComponent(
-        prompt
-      )}&first_message=${encodeURIComponent(first_message)}`,
-      statusCallback: `https://${request.headers.host}/call-status-callback`,
-      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-      statusCallbackMethod: "POST",
-    });
+const call = await twilioClient.calls.create({
+  from: TWILIO_PHONE_NUMBER,
+  to: number,
+  url: `https://${request.headers.host}/outbound-call-twiml...`,
+  machineDetection: "Enable",
+  machineDetectionSilenceTimeout: 2000,  // Reduced for faster detection
+  machineDetectionSpeechThreshold: 1500,
+  machineDetectionSpeechEndTimeout: 500,
+  asyncAmd: "true",
+  asyncAmdStatusCallback: `https://${request.headers.host}/call-status-callback`,
+  statusCallback: `https://${request.headers.host}/call-status-callback`,
+  statusCallbackEvent: ["initiated", "ringing", "answered", "completed", "busy", "failed", "no-answer"],
+});
 
     activeCalls.set(call.sid, {
       callSid: call.sid,
@@ -490,6 +491,7 @@ fastify.get("/call-status/:callSid", async (request, reply) => {
   }
 });
 
+// In /call-status-callback handler
 fastify.post("/call-status-callback", async (request, reply) => {
   const { CallSid, CallStatus, CallDuration, AnsweredBy } = request.body;
   let finalStatus = CallStatus;
@@ -498,10 +500,19 @@ fastify.post("/call-status-callback", async (request, reply) => {
     `[Twilio] Call ${CallSid} status update: ${finalStatus}, duration: ${CallDuration}s, answered by: ${AnsweredBy || "unknown"}`
   );
 
-  // Handle voicemail detection and status mapping
-  if (AnsweredBy === "machine") {
+  // Enhanced answering machine detection
+  if (["machine", "machine_start"].includes(AnsweredBy)) {
     console.log(`[Twilio] Voicemail detected for call ${CallSid}`);
     finalStatus = "voicemail";
+    
+    try {
+      // Immediately terminate voicemail calls
+      await twilioClient.calls(CallSid).update({ 
+        status: "completed" 
+      });
+    } catch (error) {
+      console.error(`[Twilio] Error ending voicemail call ${CallSid}:`, error);
+    }
   } else if (finalStatus === "no-answer") {
     finalStatus = "no-answer";
   }
@@ -510,7 +521,7 @@ fastify.post("/call-status-callback", async (request, reply) => {
     const callInfo = activeCalls.get(CallSid);
     callInfo.duration = CallDuration || 0;
 
-    // Handle terminal states immediately
+    // Handle all terminal states
     if (["voicemail", "no-answer", "busy", "failed", "canceled"].includes(finalStatus)) {
       callInfo.status = finalStatus;
       callInfo.endTime = new Date();
@@ -518,28 +529,10 @@ fastify.post("/call-status-callback", async (request, reply) => {
 
       console.log(`[Twilio] Call ${CallSid} terminated early with status: ${finalStatus}`);
 
-      // Remove from active calls faster (2 seconds instead of 1 hour)
+      // Remove from active calls faster
       setTimeout(() => {
-        console.log(`[Twilio] Removing call ${CallSid} from active calls map`);
         activeCalls.delete(CallSid);
       }, 2000);
-    }
-    // Handle in-progress initialization
-    else if (finalStatus === "in-progress") {
-      if (!callInfo.signedUrlPromise) {
-        callInfo.signedUrlPromise = getCachedSignedUrl().catch(console.error);
-      }
-      callInfo.answered = true;
-    }
-    // Handle forwarding completion
-    else if (callInfo.status === "forwarding" && finalStatus === "completed") {
-      callInfo.status = "completed";
-      callInfo.completionReason = callInfo.completionReason || "forwarded_call_ended";
-      console.log(`[Twilio] Call ${CallSid} was forwarded and is now complete`);
-    }
-    // Update status for other states
-    else {
-      callInfo.status = finalStatus;
     }
 
     // Broadcast updates
