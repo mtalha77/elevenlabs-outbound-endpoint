@@ -677,14 +677,14 @@ fastify.register(async (fastifyInstance) => {
               },
               conversation_config_override: {
                 agent: {
-                  prompt: {
-                    prompt:
-                      customParameters?.prompt ||
-                      "you are a gary from the phone store",
-                  },
-                  first_message:
-                    customParameters?.first_message ||
-                    "hey there! how can I help you today?",
+                  // prompt: {
+                  //   prompt:
+                  //     customParameters?.prompt ||
+                  //     "you are a gary from the phone store",
+                  // },
+                  // first_message:
+                  //   customParameters?.first_message ||
+                  //   "hey there! how can I help you today?",
                 },
               },
             };
